@@ -1,149 +1,90 @@
-use crate::cmd_lib;
-use crate::mlua;
-
-use super::distro;
-use super::kernel;
-use crate::errors;
-
+use crate::{cmd_lib::run_fun, errors, mlua, Inject};
+use mlua::prelude::*;
 use std::env;
 
-use cmd_lib::run_fun;
-use mlua::prelude::*;
-
-use crate::Inject;
-use distro::Distro;
-use kernel::Kernel;
+use super::{distro::Distro, kernel::Kernel};
 
 pub(crate) struct De(pub String, pub String);
 
 impl De {
+    #[inline(always)]
     pub fn new(k: &Kernel, d: &Distro) -> Option<Self> {
-        let to_return = match k.name.as_str() {
-            "Mac OS X" | "macOS" => Some(De(String::from("Aqua"), String::new())),
+        let name = match k.name.as_str() {
+            "Mac OS X" | "macOS" => return Some(De("Aqua".into(), String::new())),
+            _ if d.short_name.starts_with("Windows") => {
+                if d.short_name.starts_with("Windows 8") || d.short_name.starts_with("Windows 10") {
+                    "Modern UI/Metro"
+                } else {
+                    "Aero"
+                }
+            }
             _ => {
-                if d.short_name.starts_with("Windows") {
-                    if d.short_name.starts_with("Windows 8")
-                        || d.short_name.starts_with("Windows 10")
-                    {
-                        Some(De(String::from("Modern UI/Metro"), String::new()))
-                    } else {
-                        Some(De(String::from("Aero"), String::new()))
-                    }
-                } else if if let Ok(desktop_session) = env::var("DESKTOP_SESSION") {
-                    desktop_session == "regolith"
-                } else {
-                    false
-                } {
-                    Some(De(String::from("Regolith"), String::new()))
-                } else if let Ok(mut current_desktop) = env::var("XDG_CURRENT_DESKTOP") {
-                    current_desktop = current_desktop.replace("X-", "");
-                    // The following is from neofetch, and I have
-                    // literally no idea what it does (~line 1718):
-                    // ```bash
-                    // de=${de/Budgie:GNOME/Budgie}
-                    // de=${de/:Unity7:ubuntu}
-                    // ```
-                    // Unless somebody opens a PR with whatever
-                    // that is in Rust, I'm just gonna pretend that
-                    // code doesn't exist lol.
-                    Some(De(current_desktop, String::new()))
+                if env::var("DESKTOP_SESSION").is_ok_and(|v| v == "regolith") {
+                    "Regolith"
+                } else if let Ok(current) = env::var("XDG_CURRENT_DESKTOP") {
+                    return Some(De(current.replace("X-", ""), String::new()));
                 } else if env::var("GNOME_DESKTOP_SESSION_ID").is_ok() {
-                    Some(De(String::from("GNOME"), String::new()))
+                    "GNOME"
                 } else if env::var("MATE_DESKTOP_SESSION_ID").is_ok() {
-                    Some(De(String::from("MATE"), String::new()))
+                    "MATE"
                 } else if env::var("TDE_FULL_SESSION").is_ok() {
-                    Some(De(String::from("Trinity"), String::new()))
+                    "Trinity"
                 } else {
-                    None
+                    return None;
                 }
             }
         };
-        if let Some(mut to_return) = to_return {
-            if env::var("KDE_SESSION_VERSION")
-                .unwrap_or(String::from("0"))
-                .parse::<i32>()
+
+        let name = name.replace("KDE", "Plasma");
+
+        let version = match name.as_str() {
+            n if n.starts_with("Plasma") => run_fun!(plasmashell - -version)
                 .ok()
-                .unwrap_or(0)
-                >= 4
-            {
-                to_return.0 = to_return.0.replace("KDE", "Plasma");
+                .unwrap_or_default()
+                .replace("plasmashell ", "")
+                .replace('\n', ""),
+            n if n.starts_with("MATE") => {
+                run_fun!(mate - session - -version).ok().unwrap_or_default()
             }
-            // Get version number.
-            {
-                // In neofetch, this uses a Bash switch statement, but because
-                // Bash switch statements let you do patterns, we can't use a
-                // switch statement here.
-                if to_return.0.starts_with("Plasma") {
-                    to_return.1 = run_fun!(plasmashell - -version)
-                        .ok()
-                        .unwrap_or(String::new())
-                        .replace("plasmashell ", "")
-                        .replace('\n', "");
-                } else if to_return.0.starts_with("MATE") {
-                    to_return.1 = run_fun!(mate - session - -version)
-                        .ok()
-                        .unwrap_or(String::new());
-                } else if to_return.0.starts_with("Xfce") {
-                    to_return.1 = run_fun!(xfce4 - session - -version)
-                        .ok()
-                        .unwrap_or(String::new());
-                } else if to_return.0.starts_with("GNOME") {
-                    to_return.1 = run_fun!(gnome - shell - -version)
-                        .ok()
-                        .unwrap_or(String::new());
-                } else if to_return.0.starts_with("Cinnamon") {
-                    to_return.1 = run_fun!(cinnamon - -version).ok().unwrap_or(String::new());
-                } else if to_return.0.starts_with("Budgie") {
-                    to_return.1 = run_fun!(budgie - desktop - -version)
-                        .ok()
-                        .unwrap_or(String::new());
-                } else if to_return.0.starts_with("LXQt") {
-                    to_return.1 = run_fun!(lxqt - session - -version)
-                        .ok()
-                        .unwrap_or(String::new());
-                } else if to_return.0.starts_with("Unity") {
-                    to_return.1 = run_fun!(unity - -version).ok().unwrap_or(String::new());
-                }
+            n if n.starts_with("Xfce") => run_fun!(xfce4 - session - -version)
+                .ok()
+                .unwrap_or_default(),
+            n if n.starts_with("GNOME") => {
+                run_fun!(gnome - shell - -version).ok().unwrap_or_default()
             }
-            Some(to_return)
-        } else {
-            to_return
-        }
+            n if n.starts_with("Cinnamon") => {
+                run_fun!(cinnamon - -version).ok().unwrap_or_default()
+            }
+            n if n.starts_with("Budgie") => run_fun!(budgie - desktop - -version)
+                .ok()
+                .unwrap_or_default(),
+            n if n.starts_with("LXQt") => {
+                run_fun!(lxqt - session - -version).ok().unwrap_or_default()
+            }
+            n if n.starts_with("Unity") => run_fun!(unity - -version).ok().unwrap_or_default(),
+            _ => String::new(),
+        };
+
+        Some(De(name, version))
     }
 }
 
 impl Inject for De {
+    #[inline(always)]
     fn inject(&self, lua: &mut Lua) {
-        let globals = lua.globals();
-
-        match lua.create_table() {
-            Ok(t) => {
-                match t.set("name", self.0.as_str()) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        errors::handle(&format!("{}{err}", errors::LUA, err = e));
-                        panic!();
-                    }
-                }
-                match t.set("version", self.1.as_str()) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        errors::handle(&format!("{}{err}", errors::LUA, err = e));
-                        panic!();
-                    }
-                }
-                match globals.set("de", t) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        errors::handle(&format!("{}{err}", errors::LUA, err = e));
-                        panic!();
-                    }
-                }
-            }
-            Err(e) => {
-                errors::handle(&format!("{}{err}", errors::LUA, err = e));
-                panic!();
-            }
+        if let Ok(table) = lua.create_table() {
+            let _ = table
+                .set("name", self.0.as_str())
+                .map_err(|e| errors::handle(&format!("{}{}", errors::LUA, e)));
+            let _ = table
+                .set("version", self.1.as_str())
+                .map_err(|e| errors::handle(&format!("{}{}", errors::LUA, e)));
+            let _ = lua
+                .globals()
+                .set("de", table)
+                .map_err(|e| errors::handle(&format!("{}{}", errors::LUA, e)));
+        } else {
+            errors::handle("Failed to create Lua table for DE.");
         }
     }
 }
