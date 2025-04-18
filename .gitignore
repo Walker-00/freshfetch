@@ -1,3 +1,4 @@
 /target
 /pkg
 /freshfetch.tar.gz
+Cargo.lock
