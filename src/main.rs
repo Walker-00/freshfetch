@@ -85,7 +85,7 @@ fn main() {
     layout.inject(&mut ctx);
 
     let layout_file = Path::new("/home/")
-        .join(var("USER").unwrap_or(String::new()))
+        .join(var("USER").unwrap_or_default())
         .join(".config/freshfetch/layout.lua");
 
     if layout_file.exists() {
