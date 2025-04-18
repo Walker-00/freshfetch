@@ -1,16 +1,9 @@
-use crate::mlua;
-
 use super::kernel;
-use crate::errors;
+use crate::{errors, mlua, Inject};
 
-use std::env;
-use std::path::Path;
-use std::process::Command;
-
-use mlua::prelude::*;
-
-use crate::Inject;
 use kernel::Kernel;
+use mlua::prelude::*;
+use std::{env, path::Path, process::Command};
 
 pub(crate) struct Shell {
     pub name: String,
@@ -19,69 +12,64 @@ pub(crate) struct Shell {
 
 impl Shell {
     pub fn new(k: &Kernel) -> Self {
-        let name;
-        let version;
-        match k.name.as_str() {
-            "Linux" | "BSD" | "Windows" => {
-                let shell_bin = String::from(
-                    Path::new(&match env::var("SHELL") {
-                        Ok(v) => v,
-                        #[allow(non_fmt_panics)]
-                        Err(e) => panic!("Failed to get $SHELL. Details:\n{}", e),
-                    })
-                    .file_name()
-                    .expect("$SHELL is invalid!")
-                    .to_string_lossy(),
-                );
-                name = shell_bin;
-                match name.as_str() {
-                    "zsh" => {
-                        version = {
-                            let try_output = Command::new("zsh")
-                                .arg("-c")
-                                .arg("printf $ZSH_VERSION")
-                                .output();
-                            match try_output {
-							Ok(output) => {
-								String::from_utf8(output.stdout)
-									.expect("The output of \"zsh -c printf $ZSH_VERSION\" contained invalid UTF8.")
-							}
-							Err(_) => panic!("Failed to get ZSH_VERSION."),
-						}
-                        }
-                    }
-                    _ => version = String::new(),
+        if !matches!(k.name.as_str(), "Linux" | "BSD" | "Windows") {
+            return Shell {
+                name: String::new(),
+                version: String::new(),
+            };
+        }
+
+        let shell_env = match env::var("SHELL") {
+            Ok(val) => val,
+            Err(_) => {
+                return Shell {
+                    name: String::new(),
+                    version: String::new(),
                 }
             }
-            _ => {
-                name = String::new();
-                version = String::new();
+        };
+
+        let shell_name = Path::new(&shell_env)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let version = if shell_name == "zsh" {
+            match Command::new("zsh")
+                .arg("-c")
+                .arg("printf $ZSH_VERSION")
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                }
+                _ => String::new(),
             }
+        } else {
+            String::new()
+        };
+
+        Shell {
+            name: shell_name,
+            version,
         }
-        Shell { name, version }
     }
 }
 
 impl Inject for Shell {
     fn inject(&self, lua: &mut Lua) {
-        let globals = lua.globals();
-
-        match lua.create_table() {
-            Ok(t) => {
-                match t.set("name", self.name.as_str()) {
-                    Ok(_) => (),
-                    Err(e) => errors::handle(&format!("{}{}", errors::LUA, e)),
-                }
-                match t.set("version", self.version.as_str()) {
-                    Ok(_) => (),
-                    Err(e) => errors::handle(&format!("{}{}", errors::LUA, e)),
-                }
-                match globals.set("shell", t) {
-                    Ok(_) => (),
-                    Err(e) => errors::handle(&format!("{}{}", errors::LUA, e)),
-                }
+        if let Ok(table) = lua.create_table() {
+            if let Err(e) = table.set("name", &*self.name) {
+                errors::handle(&format!("{}{}", errors::LUA, e));
             }
-            Err(e) => errors::handle(&format!("{}{}", errors::LUA, e)),
+            if let Err(e) = table.set("version", &*self.version) {
+                errors::handle(&format!("{}{}", errors::LUA, e));
+            }
+            if let Err(e) = lua.globals().set("shell", table) {
+                errors::handle(&format!("{}{}", errors::LUA, e));
+            }
         }
     }
 }
+

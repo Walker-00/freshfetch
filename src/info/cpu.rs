@@ -1,254 +1,148 @@
 use crate::mlua;
 use crate::regex;
 
-use super::kernel;
+// use super::kernel;
 use crate::errors;
 
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use mlua::prelude::*;
 use regex::Regex;
 
 use crate::Inject;
-use kernel::Kernel;
+
+static CLEAN_NAME_REGEXES: OnceLock<Vec<Regex>> = OnceLock::new();
 
 #[derive(Debug)]
 pub(crate) struct Cpu {
-    /// The name of the CPU.
     pub name: String,
-    /// The name of the CPU, without any information cut off.
     pub full_name: String,
-    /// The frequency of the CPU, in MHz.
     pub freq: f32,
-    /// The number of cores in the CPU.
     pub cores: i32,
 }
 
 impl Cpu {
-    pub fn new(k: &Kernel) -> Option<Self> {
-        let mut name: Option<String> = None;
-        let mut freq: Option<f32> = None;
-        let mut cores: Option<i32> = None;
-        match k.name.as_str() {
-            "Linux" | "MINIX" | "Windows" => {
-                // TODO: Neofetch has some code to handle oddball CPU
-                // architectures here. Idk if rust has support for those, but
-                // porting that functionality wouldn't do much harm.
+    pub fn new() -> Option<Self> {
+        // Ensure this only runs on supported OS
+        if !cfg!(target_os = "linux") && !cfg!(target_os = "windows") {
+            return None;
+        }
 
-                match fs::read_to_string("/proc/cpuinfo") {
-                    Ok(cpu_info) => {
-                        let cpu_info_lines: Vec<&str> = cpu_info.split('\n').collect();
+        let cpu_info = fs::read_to_string("/proc/cpuinfo").ok()?;
+        let mut name = None;
+        let mut freq = None;
+        let mut cores = 0;
 
-                        // Get CPU name.
-                        name = {
-                            let mut to_return = None;
-                            let mut skip = false;
-                            for line in cpu_info_lines.iter() {
-                                if !skip && line.starts_with("model name")
-                                    || line.starts_with("Hardware")
-                                    || line.starts_with("Processor")
-                                    || line.starts_with("cpu model")
-                                    || line.starts_with("chip type")
-                                    || line.starts_with("cpu type")
-                                {
-                                    let split: Vec<&str> = line.split(": ").collect();
-                                    to_return = Some(String::from(split[1]));
-                                    skip = true;
-                                }
-                            }
-                            to_return
-                        };
+        for line in cpu_info.lines() {
+            if name.is_none()
+                && (line.starts_with("model name")
+                    || line.starts_with("Hardware")
+                    || line.starts_with("Processor")
+                    || line.starts_with("cpu model")
+                    || line.starts_with("chip type")
+                    || line.starts_with("cpu type"))
+            {
+                if let Some((_, val)) = line.split_once(":") {
+                    name = Some(val.trim().to_string());
+                }
+            } else if freq.is_none() && (line.starts_with("cpu MHz") || line.starts_with("clock")) {
+                if let Some((_, val)) = line.split_once(":") {
+                    let cleaned = val.trim().replace("MHz", "");
+                    freq = cleaned.parse::<f32>().ok().map(|f| f / 1000.0);
+                }
+            } else if line.starts_with("processor") {
+                cores += 1;
+            }
 
-                        // Get CPU frequency.
-                        freq = {
-                            if Path::new("/sys/devices/system/cpu/cpu0/cpufreq/").exists() {
-                                let mut to_return = None;
-                                let to_check = [
-                                    "/sys/devices/system/cpu/cpu0/cpufreq/bios_limit",
-                                    "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq",
-                                    "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
-                                ];
-                                for file in to_check.iter() {
-                                    if to_return.is_none() {
-                                        if let Ok(mut bios_limit) = fs::read_to_string(file) {
-                                            bios_limit = bios_limit.replace(['\n', '\t'], "");
-                                            match bios_limit.parse::<f32>() {
-                                                Ok(freq) => to_return = Some(freq / 1000.0),
-                                                Err(e) => {
-                                                    errors::handle(
-                                                        &format!("{}{v}{}{type}{}{err}",
-                                                                       errors::PARSE.0,
-                                                                       errors::PARSE.1,
-                                                                       errors::PARSE.2,
-                                                                       v = bios_limit,
-                                                                       type = "f32",
-                                                                       err = e),
-                                                    );
-                                                    panic!();
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                to_return
-                            } else {
-                                let mut to_return = None;
-                                let mut skip = false;
-                                for line in cpu_info_lines.iter() {
-                                    if !skip && line.starts_with("cpu MHz")
-                                        || line.starts_with("clock")
-                                    {
-                                        let split: Vec<&str> = line.split(": ").collect();
-                                        let to_parse = String::from(split[1]).replace("MHz", "");
-                                        to_return = match to_parse.parse::<f32>() {
-                                            Ok(freq) => Some(freq / 1000.0),
-                                            Err(e) => {
-                                                errors::handle(&format!("{}{v}{}{type}{}{err}",
-														errors::PARSE.0,
-														errors::PARSE.1,
-														errors::PARSE.2,
-														v = to_parse,
-														type = "f32",
-														err = e));
-                                                panic!();
-                                            }
-                                        };
-                                        skip = true;
-                                    }
-                                }
-                                to_return
-                            }
-                        };
+            if name.is_some() && freq.is_some() {
+                continue;
+            }
+        }
 
-                        // Get CPU cores.
-                        cores = {
-                            let mut to_return = 0;
-                            for line in cpu_info_lines.iter() {
-                                if line.starts_with("processor") {
-                                    to_return += 1;
-                                }
-                            }
-                            Some(to_return)
-                        };
-                    }
-                    Err(e) => {
-                        errors::handle(&format!(
-                            "{}{file}{}{err}",
-                            errors::io::READ.0,
-                            errors::io::READ.1,
-                            file = "/proc/cpuinfo",
-                            err = e
-                        ));
-                        panic!();
+        // Try cpufreq fallback if needed
+        if freq.is_none() && Path::new("/sys/devices/system/cpu/cpu0/cpufreq/").exists() {
+            for file in [
+                "/sys/devices/system/cpu/cpu0/cpufreq/bios_limit",
+                "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq",
+                "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
+            ] {
+                if let Ok(val) = fs::read_to_string(file) {
+                    if let Ok(parsed) = val.trim().parse::<f32>() {
+                        freq = Some(parsed / 1000.0);
+                        break;
                     }
                 }
             }
-            _ => (),
         }
-        if let (Some(full_name), Some(freq), Some(cores)) = (name, freq, cores) {
-            Some(Cpu {
-                name: {
-                    let mut to_return = full_name
-                        .replace("(tm)", "")
-                        .replace("(TM)", "")
-                        .replace("(R)", "")
-                        .replace("(r)", "")
-                        .replace("CPU", "")
-                        .replace("Processor", "")
-                        .replace("Dual-Core", "")
-                        .replace("Quad-Core", "")
-                        .replace("Six-Core", "")
-                        .replace("Eight-Core", "")
-                        .replace("Quad-Core", "");
-                    {
-                        let regex = Regex::new(r#"(?i)\d\d?-Core"#).unwrap();
-                        to_return = String::from(regex.replace_all(&to_return, ""));
-                    }
-                    {
-                        let regex = Regex::new(r#"(?i), .*? Compute Cores"#).unwrap();
-                        to_return = String::from(regex.replace_all(&to_return, ""));
-                    }
-                    to_return = to_return.replace("Cores ", " ");
-                    {
-                        let regex = Regex::new(r#"(?i)\("AuthenticAMD".*?\)"#).unwrap();
-                        to_return = String::from(regex.replace_all(&to_return, ""));
-                    }
-                    {
-                        let regex = Regex::new(r#"(?i)with Radeon .*? Graphics"#).unwrap();
-                        to_return = String::from(regex.replace_all(&to_return, ""));
-                    }
-                    to_return = to_return
-                        .replace(", altivec supported", "")
-                        .replace("Technologies, Inc", "")
-                        .replace("Core2", "Core 2");
-                    {
-                        let regex = Regex::new(r#"FPU.*?"#).unwrap();
-                        to_return = String::from(regex.replace_all(&to_return, ""));
-                    }
-                    {
-                        let regex = Regex::new(r#"Chip Revision.*?"#).unwrap();
-                        to_return = String::from(regex.replace_all(&to_return, ""));
-                    }
-                    to_return = String::from(to_return.trim());
-                    to_return
-                },
-                full_name,
-                freq,
-                cores,
-            })
-        } else {
-            None
+
+        let (full_name, freq, cores) = (name?, freq?, cores);
+
+        let cleaned_name = Self::clean_name(&full_name);
+
+        Some(Self {
+            name: cleaned_name,
+            full_name,
+            freq,
+            cores,
+        })
+    }
+
+    fn clean_name(original: &str) -> String {
+        let mut name = original.to_string();
+
+        for pattern in CLEAN_NAME_REGEXES.get_or_init(|| {
+            vec![
+                Regex::new(r"(?i)\(TM\)|\(tm\)").unwrap(),
+                Regex::new(r"(?i)\(R\)|\(r\)").unwrap(),
+                Regex::new(r"\bCPU\b").unwrap(),
+                Regex::new(r"\bProcessor\b").unwrap(),
+                Regex::new(r"\b\w+-Core\b").unwrap(),
+                Regex::new(r"(?i), .*? Compute Cores").unwrap(),
+                Regex::new(r#"(?i)\("AuthenticAMD".*?\)"#).unwrap(),
+                Regex::new(r#"(?i)with Radeon .*? Graphics"#).unwrap(),
+                Regex::new(r"(?i)altivec supported").unwrap(),
+                Regex::new(r"(?i)Technologies, Inc").unwrap(),
+                Regex::new(r"(?i)FPU.*?").unwrap(),
+                Regex::new(r"(?i)Chip Revision.*?").unwrap(),
+            ]
+        }) {
+            name = pattern.replace_all(&name, "").to_string();
         }
+
+        name.replace("Core2", "Core 2")
+            .replace("Cores ", " ")
+            .trim()
+            .to_string()
     }
 }
 
 impl Inject for Cpu {
     fn inject(&self, lua: &mut Lua) {
         let globals = lua.globals();
+        let t = lua.create_table().unwrap();
 
-        match lua.create_table() {
-            Ok(t) => {
-                match t.set("name", self.name.as_str()) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        errors::handle(&format!("{}{}", errors::LUA, e));
-                        panic!();
-                    }
-                }
-                match t.set("fullName", self.full_name.as_str()) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        errors::handle(&format!("{}{}", errors::LUA, e));
-                        panic!();
-                    }
-                }
-                match t.set("cores", self.cores) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        errors::handle(&format!("{}{}", errors::LUA, e));
-                        panic!();
-                    }
-                }
-                match t.set("freq", self.freq) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        errors::handle(&format!("{}{}", errors::LUA, e));
-                        panic!();
-                    }
-                }
-                match globals.set("cpu", t) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        errors::handle(&format!("{}{}", errors::LUA, e));
-                        panic!();
-                    }
-                }
-            }
-            Err(e) => {
-                errors::handle(&format!("{}{}", errors::LUA, e));
-                panic!();
-            }
-        }
+        t.set("name", &*self.name).unwrap_or_else(|e| {
+            errors::handle(&format!("{}{}", errors::LUA, e));
+            panic!();
+        });
+        t.set("fullName", &*self.full_name).unwrap_or_else(|e| {
+            errors::handle(&format!("{}{}", errors::LUA, e));
+            panic!();
+        });
+        t.set("freq", self.freq).unwrap_or_else(|e| {
+            errors::handle(&format!("{}{}", errors::LUA, e));
+            panic!();
+        });
+        t.set("cores", self.cores).unwrap_or_else(|e| {
+            errors::handle(&format!("{}{}", errors::LUA, e));
+            panic!();
+        });
+
+        globals.set("cpu", t).unwrap_or_else(|e| {
+            errors::handle(&format!("{}{}", errors::LUA, e));
+            panic!();
+        });
     }
 }

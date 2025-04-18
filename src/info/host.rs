@@ -1,16 +1,9 @@
-use crate::mlua;
-use crate::regex;
-
 use super::kernel;
-use crate::errors;
-
-use std::fs::read_to_string;
-
+use crate::{errors, mlua, regex, Inject};
+use kernel::Kernel;
 use mlua::prelude::*;
 use regex::Regex;
-
-use crate::Inject;
-use kernel::Kernel;
+use std::fs;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Host {
@@ -19,56 +12,58 @@ pub(crate) struct Host {
 
 impl Host {
     pub fn new(k: &Kernel) -> Option<Self> {
-        match k.name.as_str() {
-            "Linux" => {
-                let mut product_name =
-                    match read_to_string("/sys/devices/virtual/dmi/id/product_name") {
-                        Ok(product_name) => product_name,
-                        Err(_) => return None,
-                    };
-                product_name = product_name
-                    .replace('\n', "")
-                    .replace("To Be Filled By O.E.M.", "")
-                    .replace("Not Applicable", "")
-                    .replace("System Product Name", "")
-                    .replace("Undefined", "")
-                    .replace("Default string", "")
-                    .replace("Not Specified", "")
-                    .replace("INVALID", "")
-                    .replace('�', "");
-                {
-                    let regex = Regex::new(r#"(?i)To Be Filled.*?"#).unwrap();
-                    product_name = String::from(regex.replace_all(&product_name, ""));
-                }
-                product_name = String::from(product_name.trim());
-                if !product_name.is_empty() {
-                    Some(Host {
-                        model: product_name,
-                    })
-                } else {
-                    None
-                }
-            }
-            _ => None,
+        if k.name != "Linux" {
+            return None;
         }
+
+        let raw = fs::read_to_string("/sys/devices/virtual/dmi/id/product_name").ok()?;
+        let cleaned = Self::clean_product_name(&raw);
+
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(Host { model: cleaned })
+        }
+    }
+
+    fn clean_product_name(s: &str) -> String {
+        // Compile once, statically
+        static PATTERN: &[&str] = &[
+            "To Be Filled By O.E.M.",
+            "Not Applicable",
+            "System Product Name",
+            "Undefined",
+            "Default string",
+            "Not Specified",
+            "INVALID",
+            "�",
+        ];
+        static REGEX: once_cell::sync::Lazy<Regex> =
+            once_cell::sync::Lazy::new(|| Regex::new(r"(?i)To Be Filled.*?").unwrap());
+
+        let mut result = s.trim().to_owned();
+
+        for pat in PATTERN {
+            result = result.replace(pat, "");
+        }
+
+        result = REGEX.replace_all(&result, "").into_owned();
+        result.trim().to_string()
     }
 }
 
 impl Inject for Host {
     fn inject(&self, lua: &mut Lua) {
         let globals = lua.globals();
-        match lua.create_table() {
-            Ok(t) => {
-                match t.set("model", self.model.as_str()) {
-                    Ok(_) => (),
-                    Err(e) => errors::handle(&format!("{}{}", errors::LUA, e)),
-                }
-                match globals.set("host", t) {
-                    Ok(_) => (),
-                    Err(e) => errors::handle(&format!("{}{}", errors::LUA, e)),
-                }
+        if let Ok(t) = lua.create_table() {
+            if let Err(e) = t.set("model", self.model.as_str()) {
+                errors::handle(&format!("{}{}", errors::LUA, e));
             }
-            Err(e) => errors::handle(&format!("{}{}", errors::LUA, e)),
+            if let Err(e) = globals.set("host", t) {
+                errors::handle(&format!("{}{}", errors::LUA, e));
+            }
+        } else if let Err(e) = lua.create_table() {
+            errors::handle(&format!("{}{}", errors::LUA, e));
         }
     }
 }

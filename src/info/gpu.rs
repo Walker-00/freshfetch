@@ -1,21 +1,31 @@
 use std::fs::{self, read_to_string};
-use std::path::PathBuf;
+
+use crate::{errors, mlua, Inject};
+use mlua::prelude::*;
 
 #[derive(Clone, Debug)]
-pub struct Gpu {
+pub(crate) struct Gpu {
     pub brand: String,
     pub name: String,
 }
 
+impl Gpu {
+    #[inline]
+    pub fn new(name: impl Into<String>, brand: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            brand: brand.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-pub struct Gpus(pub Vec<Gpu>);
+pub(crate) struct Gpus(pub Vec<Gpu>);
 
 impl Gpus {
     pub fn new() -> Option<Self> {
         let mut gpus = Vec::new();
-
-        let drm_dir = PathBuf::from("/sys/class/drm/");
-        let Ok(entries) = fs::read_dir(drm_dir) else {
+        let Ok(entries) = fs::read_dir("/sys/class/drm/") else {
             return None;
         };
 
@@ -40,16 +50,51 @@ impl Gpus {
                 _ => "Unknown",
             };
 
-            gpus.push(Gpu {
-                brand: brand.to_string(),
-                name: format!("Device ID: {}", device_id),
-            });
+            let name = format!("PCI ID: {}", device_id);
+            gpus.push(Gpu::new(name, brand));
         }
 
         if gpus.is_empty() {
             None
         } else {
             Some(Gpus(gpus))
+        }
+    }
+}
+
+impl Inject for Gpus {
+    fn inject(&self, lua: &mut Lua) {
+        let globals = lua.globals();
+
+        match lua.create_table() {
+            Ok(gpu_table) => {
+                for (i, gpu) in self.0.iter().enumerate() {
+                    match lua.create_table() {
+                        Ok(t) => {
+                            if t.set("name", &*gpu.name).is_err()
+                                || t.set("brand", &*gpu.brand).is_err()
+                                || gpu_table.raw_set((i + 1) as i64, t).is_err()
+                            {
+                                errors::handle("Failed to inject GPU info to Lua");
+                                panic!();
+                            }
+                        }
+                        Err(e) => {
+                            errors::handle(&format!("{}{}", errors::LUA, e));
+                            panic!();
+                        }
+                    }
+                }
+
+                if let Err(e) = globals.set("gpus", gpu_table) {
+                    errors::handle(&format!("{}{}", errors::LUA, e));
+                    panic!();
+                }
+            }
+            Err(e) => {
+                errors::handle(&format!("{}{}", errors::LUA, e));
+                panic!();
+            }
         }
     }
 }

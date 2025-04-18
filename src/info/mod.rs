@@ -1,10 +1,18 @@
-use crate::mlua;
-use crate::regex;
-use crate::sysinfo;
-
 use crate::assets;
 use crate::assets::defaults;
 use crate::errors;
+use crate::mlua;
+use crate::regex;
+use crate::sysinfo;
+use mlua::prelude::*;
+use regex::Regex;
+use std::fs;
+use std::path::Path;
+// use std::process::Command;
+// use std::sync::OnceLock;
+use std::thread;
+use sysinfo::SystemExt;
+
 pub(crate) mod context;
 pub(crate) mod cpu;
 pub(crate) mod de;
@@ -20,13 +28,6 @@ pub(crate) mod shell;
 pub(crate) mod uptime;
 pub(crate) mod utils;
 pub(crate) mod wm;
-
-use std::fs;
-use std::path::Path;
-
-use mlua::prelude::*;
-use regex::Regex;
-use sysinfo::SystemExt;
 
 use crate::Inject;
 use assets::{ANSI, PRINT};
@@ -46,6 +47,37 @@ use shell::Shell;
 use uptime::Uptime;
 use utils::get_system;
 use wm::Wm;
+
+// static LSPCI_CACHE: OnceLock<String> = OnceLock::new();
+// static GPU_REGEX: OnceLock<Regex> = OnceLock::new();
+//
+// fn cached_lspci_output() -> String {
+//     LSPCI_CACHE
+//         .get_or_init(|| {
+//             Command::new("sh")
+//                 .arg("-c")
+//                 .arg("lspci -mm")
+//                 .output()
+//                 .ok()
+//                 .and_then(|o| String::from_utf8(o.stdout).ok())
+//                 .unwrap_or_default()
+//         })
+//         .clone()
+// }
+
+fn fetch_parallel_info() -> (Option<Cpu>, Memory, Option<Gpus>) {
+    let cpu_thread = thread::spawn(Cpu::new);
+
+    let memory_thread = thread::spawn(Memory::new);
+
+    let gpu_thread = thread::spawn(Gpus::new);
+
+    let cpu = cpu_thread.join().unwrap();
+    let memory = memory_thread.join().unwrap();
+    let gpu = gpu_thread.join().unwrap();
+
+    (cpu, memory, gpu)
+}
 
 pub(crate) struct Info {
     ctx: Lua,
@@ -71,20 +103,22 @@ pub(crate) struct Info {
 impl Info {
     pub fn new() -> Self {
         get_system().refresh_all();
+
         let kernel = Kernel::new();
         let context = Context::new();
+
+        let (cpu, memory, gpu) = fetch_parallel_info();
+
         let distro = Distro::new(&kernel);
+        let de = De::new(&kernel, &distro);
+        let resolution = Resolution::new(&kernel);
+        let wm = Wm::new(&kernel);
+        let shell = Shell::new(&kernel);
         let uptime = Uptime::new(&kernel);
         let package_managers = PackageManagers::new(&kernel);
-        let shell = Shell::new(&kernel);
-        let resolution = Resolution::new(&kernel);
-        let de = De::new(&kernel, &distro);
-        let wm = Wm::new(&kernel);
-        let cpu = Cpu::new(&kernel);
-        let gpu = Gpus::new(&kernel);
-        let memory = Memory::new();
         let motherboard = Motherboard::new(&kernel);
         let host = Host::new(&kernel);
+
         Info {
             ctx: Lua::new(),
             rendered: String::new(),
@@ -102,25 +136,22 @@ impl Info {
             cpu,
             gpu,
             memory,
-            motherboard,
-            host,
+            motherboard: Some(motherboard.unwrap()),
+            host: Some(host.unwrap()),
         }
     }
+
     pub fn render(&mut self) {
-        match self.ctx.load(PRINT).exec() {
-            Ok(_) => (),
-            Err(e) => {
-                errors::handle(&format!("{}{}", errors::LUA, e));
-                panic!();
-            }
+        if let Err(e) = self.ctx.load(PRINT).exec() {
+            errors::handle(&format!("{}{}", errors::LUA, e));
+            panic!();
         }
-        match self.ctx.load(ANSI).exec() {
-            Ok(_) => (),
-            Err(e) => {
-                errors::handle(&format!("{}{}", errors::LUA, e));
-                panic!();
-            }
+
+        if let Err(e) = self.ctx.load(ANSI).exec() {
+            errors::handle(&format!("{}{}", errors::LUA, e));
+            panic!();
         }
+
         let info = Path::new("/home/")
             .join(
                 self.context
@@ -132,6 +163,7 @@ impl Info {
                     .user,
             )
             .join(".config/freshfetch/info.lua");
+
         if info.exists() {
             match fs::read_to_string(&info) {
                 Ok(file) => {
@@ -182,82 +214,74 @@ impl Info {
 
 impl Inject for Info {
     fn prep(&mut self) {
-        match &self.context {
-            Some(v) => v.inject(&mut self.ctx),
-            None => (),
+        if let Some(v) = &self.context {
+            v.inject(&mut self.ctx);
         }
+
         self.kernel.inject(&mut self.ctx);
         self.distro.inject(&mut self.ctx);
         self.uptime.inject(&mut self.ctx);
         self.package_managers.inject(&mut self.ctx);
         self.shell.inject(&mut self.ctx);
-        match &self.resolution {
-            Some(v) => v.inject(&mut self.ctx),
-            None => (),
+
+        if let Some(v) = &self.resolution {
+            v.inject(&mut self.ctx);
         }
-        match &self.wm {
-            Some(v) => v.inject(&mut self.ctx),
-            None => (),
+        if let Some(v) = &self.wm {
+            v.inject(&mut self.ctx);
         }
-        match &self.de {
-            Some(v) => v.inject(&mut self.ctx),
-            None => (),
+        if let Some(v) = &self.de {
+            v.inject(&mut self.ctx);
         }
-        match &self.cpu {
-            Some(v) => v.inject(&mut self.ctx),
-            None => (),
+        if let Some(v) = &self.cpu {
+            v.inject(&mut self.ctx);
         }
-        match &self.gpu {
-            Some(v) => v.inject(&mut self.ctx),
-            None => (),
+        if let Some(v) = &self.gpu {
+            v.inject(&mut self.ctx);
         }
         self.memory.inject(&mut self.ctx);
-        match &self.motherboard {
-            Some(v) => v.inject(&mut self.ctx),
-            None => (),
+
+        if let Some(v) = &self.motherboard {
+            v.inject(&mut self.ctx);
         }
-        match &self.host {
-            Some(v) => v.inject(&mut self.ctx),
-            None => (),
+        if let Some(v) = &self.host {
+            v.inject(&mut self.ctx);
         }
+
         self.render();
-        {
-            let plaintext = {
-                let regex = Regex::new(r#"(?i)\[(?:[\d;]*\d+[a-z])"#).unwrap();
-                String::from(regex.replace_all(&self.rendered, ""))
-            };
 
-            let mut w = 0usize;
-            let mut h = 0usize;
+        // Strip ANSI codes and compute width & height
+        let plaintext = {
+            let regex = Regex::new(r#"(?i)\x1b\[[\d;]*[a-zA-Z]"#).unwrap();
+            regex.replace_all(&self.rendered, "").to_string()
+        };
 
-            for line in plaintext.split('\n').collect::<Vec<&str>>() {
-                {
-                    let len = line.chars().collect::<Vec<char>>().len();
-                    if len > w {
-                        w = len;
-                    }
-                }
-                h += 1;
+        let mut w = 0usize;
+        let mut h = 0usize;
+
+        for line in plaintext.lines() {
+            let len = line.chars().count();
+            if len > w {
+                w = len;
             }
-
-            self.width = w as i32;
-            self.height = h as i32;
+            h += 1;
         }
+
+        self.width = w as i32;
+        self.height = h as i32;
     }
+
     fn inject(&self, lua: &mut Lua) {
         let globals = lua.globals();
 
-        match globals.set("info", self.rendered.as_str()) {
-            Ok(_) => (),
-            Err(e) => errors::handle(&format!("{}{}", errors::LUA, e)),
+        if let Err(e) = globals.set("info", self.rendered.as_str()) {
+            errors::handle(&format!("{}{}", errors::LUA, e));
         }
-        match globals.set("infoWidth", self.width) {
-            Ok(_) => (),
-            Err(e) => errors::handle(&format!("{}{}", errors::LUA, e)),
+        if let Err(e) = globals.set("infoWidth", self.width) {
+            errors::handle(&format!("{}{}", errors::LUA, e));
         }
-        match globals.set("infoHeight", self.height) {
-            Ok(_) => (),
-            Err(e) => errors::handle(&format!("{}{}", errors::LUA, e)),
+        if let Err(e) = globals.set("infoHeight", self.height) {
+            errors::handle(&format!("{}{}", errors::LUA, e));
         }
     }
 }
